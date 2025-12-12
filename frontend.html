@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Math Solver (Groq + Cloudflare)</title>
+
+  <!-- KaTeX -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
+
+  <style>
+    body {
+      background: #eef3ff;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    .box {
+      max-width: 700px;
+      margin: auto;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.1);
+    }
+    #output {
+      margin-top: 20px;
+      padding: 15px;
+      white-space: pre-wrap;
+      background: #f0f4ff;
+      border-radius: 10px;
+      font-size: 17px;
+    }
+    #ocr-debug {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #555;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+
+<div class="box">
+  <h2>📘 AI Math Solver (Groq OCR + Cloudflare Solver)</h2>
+
+  <input type="file" id="img" accept="image/*">
+
+  <button id="btn" style="margin-top: 15px; padding: 10px; width:100%;">
+    Solve
+  </button>
+
+  <div id="loader" style="display:none; margin-top:10px; font-weight:bold;">
+    ⏳ Processing...
+  </div>
+
+  <div id="ocr-debug"></div>
+  <div id="output"></div>
+</div>
+
+<script>
+/* ----------------------------------------
+   1. Convert file → dataURL
+---------------------------------------- */
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result); // data:image/png;base64,....
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ----------------------------------------
+   2. OCR using Groq LLaMA-4 Maverick
+---------------------------------------- */
+async function extractOCR(file) {
+  const dataUrl = await fileToDataUrl(file); // image as data URL
+
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // ⚠️ Replace this with your real Groq key:
+      "Authorization": "Bearer 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"
+    },
+    body: JSON.stringify({
+      model: "meta-llama/llama-4-maverick-17b-128e-instruct",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `
+You are an OCR assistant for math problems.
+
+TASK:
+- Look at the image.
+- Extract ONLY the math equation or problem statement.
+- Output in clean LaTeX.
+- No explanation, no English sentences, no steps.
+- One line per equation if there are multiple.
+              `.trim()
+            },
+            {
+              type: "image_url",
+              image_url: { url: dataUrl }
+            }
+          ]
+        }
+      ],
+      temperature: 0
+    })
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error("Groq OCR HTTP " + res.status + ": " + errText);
+  }
+
+  const data = await res.json();
+  console.log("Groq OCR RAW:", data);
+
+  // Groq: choices[0].message.content = [{type:"text", text:"..."}]
+  let ocr = "";
+
+// Groq sometimes returns array of {type,text}, sometimes plain string
+const content = data.choices?.[0]?.message?.content;
+
+// CASE 1: Array format
+if (Array.isArray(content)) {
+  const textPart = content.find(item => item.type === "text");
+  ocr = textPart?.text || "";
+}
+// CASE 2: String format
+else if (typeof content === "string") {
+  ocr = content;
+}
+// CASE 3: Unexpected (fallback)
+else {
+  ocr = JSON.stringify(content);
+}
+
+ocr = ocr.trim();
+return ocr;
+
+
+  return ocr.trim();
+}
+
+/* ----------------------------------------
+   3. Solve using Cloudflare Worker (math-solver)
+---------------------------------------- */
+async function solveWithCloudflare(question) {
+  const res = await fetch("https://math-solver.mrzafar137.workers.dev/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question })
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error("Worker error " + res.status + ": " + text);
+  }
+  return text;
+}
+
+/* ----------------------------------------
+   4. Button click → full pipeline
+---------------------------------------- */
+document.getElementById("btn").onclick = async () => {
+  const file = document.getElementById("img").files[0];
+  if (!file) return alert("Choose an image!");
+
+  const loader = document.getElementById("loader");
+  const ocrBox = document.getElementById("ocr-debug");
+  const out = document.getElementById("output");
+
+  loader.style.display = "block";
+  ocrBox.textContent = "";
+  out.textContent = "";
+
+  try {
+    // 1) OCR from Groq
+    const ocrLatex = await extractOCR(file);
+    if (!ocrLatex) {
+      ocrBox.textContent = "OCR text is empty. Groq didn't read anything.";
+      loader.style.display = "none";
+      return;
+    }
+
+    ocrBox.textContent = "Extracted OCR (LaTeX):\n" + ocrLatex;
+
+    // 2) Solve via Cloudflare Worker
+    const solution = await solveWithCloudflare(ocrLatex);
+
+    // 3) Display combined output
+    out.textContent = `QUESTION (OCR):\n${ocrLatex}\n\n${solution}`;
+
+    // 4) Render LaTeX with KaTeX
+    setTimeout(() => {
+      renderMathInElement(out, {
+        delimiters: [
+          { left: "$$", right: "$$", display: true },
+          { left: "$", right: "$", display: false },
+        ]
+      });
+    }, 50);
+  } catch (err) {
+    out.textContent = "ERROR:\n" + (err.message || String(err));
+  }
+
+  loader.style.display = "none";
+};
+</script>
+
+</body>
+</html>
